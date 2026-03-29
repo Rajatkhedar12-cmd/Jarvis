@@ -192,3 +192,5 @@ Built by [Ethan Rogers](https://ethanplus.ai).
 Powered by [Anthropic Claude](https://anthropic.com) and [Fish Audio](https://fish.audio).
 
 Inspired by the AI that started it all -- Tony Stark's JARVIS.
+
+> **Disclaimer:** This is an independent fan project and is not affiliated with, endorsed by, or connected to Marvel Entertainment, The Walt Disney Company, or any related entities. The JARVIS name and character are property of Marvel Entertainment.
