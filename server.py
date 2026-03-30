@@ -887,7 +887,7 @@ def _find_project_dir(project_name: str) -> str | None:
     return None
 
 
-async def _execute_prompt_project(project_name: str, prompt: str, work_session: WorkSession, ws, dispatch_id: int = None, history: list[dict] = None):
+async def _execute_prompt_project(project_name: str, prompt: str, work_session: WorkSession, ws, dispatch_id: int = None, history: list[dict] = None, voice_state: dict = None):
     """Dispatch a prompt to Claude Code in a project directory.
 
     Runs entirely in the background. JARVIS returns to conversation mode
@@ -968,20 +968,24 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
             else:
                 msg = f"Sir, {project_name} is done. {full_response[:200]}"
 
-        # Speak the result — this interrupts whatever JARVIS is doing
+        # Speak the result — skip if user has spoken recently to avoid audio collision
         log.info(f"Dispatch summary for {project_name}: {msg[:100]}")
-        audio = await synthesize_speech(strip_markdown_for_tts(msg))
-        if ws:
-            try:
-                await ws.send_json({"type": "status", "state": "speaking"})
-                if audio:
-                    await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
-                    log.info(f"Dispatch audio sent for {project_name}")
-                else:
-                    await ws.send_json({"type": "text", "text": msg})
-                    log.info(f"Dispatch text fallback sent for {project_name}")
-            except Exception as e:
-                log.error(f"Dispatch audio send failed: {e}")
+        if voice_state and time.time() - voice_state["last_user_time"] < 3:
+            log.info(f"Skipping dispatch audio for {project_name} — user spoke recently")
+            # Result is still stored in history below so JARVIS can reference it
+        else:
+            audio = await synthesize_speech(strip_markdown_for_tts(msg))
+            if ws:
+                try:
+                    await ws.send_json({"type": "status", "state": "speaking"})
+                    if audio:
+                        await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+                        log.info(f"Dispatch audio sent for {project_name}")
+                    else:
+                        await ws.send_json({"type": "text", "text": msg})
+                        log.info(f"Dispatch text fallback sent for {project_name}")
+                except Exception as e:
+                    log.error(f"Dispatch audio send failed: {e}")
 
         # Store dispatch result in conversation history so JARVIS remembers it
         if history is not None:
@@ -1573,7 +1577,7 @@ async def handle_show_recent() -> str:
 _active_lookups: dict[str, dict] = {}  # id -> {"type": str, "status": str, "started": float}
 
 
-async def _lookup_and_report(lookup_type: str, lookup_fn, ws, history: list[dict] = None):
+async def _lookup_and_report(lookup_type: str, lookup_fn, ws, history: list[dict] = None, voice_state: dict = None):
     """Run a slow lookup, then speak the result back.
 
     JARVIS stays conversational — this runs completely off the main path.
@@ -1595,18 +1599,22 @@ async def _lookup_and_report(lookup_type: str, lookup_fn, ws, history: list[dict
 
         _active_lookups[lookup_id]["status"] = "done"
 
-        # Speak the result
-        tts = strip_markdown_for_tts(result_text)
-        audio = await synthesize_speech(tts)
-        try:
-            await ws.send_json({"type": "status", "state": "speaking"})
-            if audio:
-                await ws.send_json({"type": "audio", "data": audio, "text": result_text})
-            else:
-                await ws.send_json({"type": "text", "text": result_text})
-            await ws.send_json({"type": "status", "state": "idle"})
-        except Exception:
-            pass
+        # Speak the result — skip audio if user spoke recently to avoid collision
+        if voice_state and time.time() - voice_state["last_user_time"] < 3:
+            log.info(f"Skipping lookup audio for {lookup_type} — user spoke recently")
+            # Result is still stored in history below
+        else:
+            tts = strip_markdown_for_tts(result_text)
+            audio = await synthesize_speech(tts)
+            try:
+                await ws.send_json({"type": "status", "state": "speaking"})
+                if audio:
+                    await ws.send_json({"type": "audio", "data": audio, "text": result_text})
+                else:
+                    await ws.send_json({"type": "text", "text": result_text})
+                await ws.send_json({"type": "status", "state": "idle"})
+            except Exception:
+                pass
 
         log.info(f"Lookup {lookup_type} complete: {result_text[:80]}")
 
@@ -1834,6 +1842,9 @@ async def voice_handler(ws: WebSocket):
     _current_response_id = 0
     _cancel_response = False
 
+    # Audio collision prevention — track when user last spoke
+    voice_state = {"last_user_time": 0.0}
+
     log.info("Voice WebSocket connected")
 
     try:
@@ -1908,6 +1919,7 @@ async def voice_handler(ws: WebSocket):
             await asyncio.sleep(0.05)  # Let any pending sends notice the cancellation
             _cancel_response = False
 
+            voice_state["last_user_time"] = time.time()
             log.info(f"User: {user_text}")
             await ws.send_json({"type": "status", "state": "thinking"})
 
@@ -1945,7 +1957,7 @@ async def voice_handler(ws: WebSocket):
                         os.makedirs(path, exist_ok=True)
                         Path(path, "CLAUDE.md").write_text(prompt)
                         did = dispatch_registry.register(name, path, prompt[:200])
-                        asyncio.create_task(_execute_prompt_project(name, prompt, work_session, ws, dispatch_id=did, history=history))
+                        asyncio.create_task(_execute_prompt_project(name, prompt, work_session, ws, dispatch_id=did, history=history, voice_state=voice_state))
                         planner.reset()
                         response_text = "Building it now, sir."
                     elif planner.active_plan and planner.active_plan.confirmed is False and planner.active_plan.current_question_index >= len(planner.active_plan.pending_questions):
@@ -1958,7 +1970,7 @@ async def voice_handler(ws: WebSocket):
                             os.makedirs(path, exist_ok=True)
                             Path(path, "CLAUDE.md").write_text(prompt)
                             did = dispatch_registry.register(name, path, prompt[:200])
-                            asyncio.create_task(_execute_prompt_project(name, prompt, work_session, ws, dispatch_id=did, history=history))
+                            asyncio.create_task(_execute_prompt_project(name, prompt, work_session, ws, dispatch_id=did, history=history, voice_state=voice_state))
                             planner.reset()
                             response_text = "On it, sir."
                         elif result["cancelled"]:
@@ -2052,13 +2064,13 @@ async def voice_handler(ws: WebSocket):
                             response_text = await handle_show_recent()
                         elif action["action"] == "describe_screen":
                             response_text = "Taking a look now, sir."
-                            asyncio.create_task(_lookup_and_report("screen", _do_screen_lookup, ws, history=history))
+                            asyncio.create_task(_lookup_and_report("screen", _do_screen_lookup, ws, history=history, voice_state=voice_state))
                         elif action["action"] == "check_calendar":
                             response_text = "Checking your calendar now, sir."
-                            asyncio.create_task(_lookup_and_report("calendar", _do_calendar_lookup, ws, history=history))
+                            asyncio.create_task(_lookup_and_report("calendar", _do_calendar_lookup, ws, history=history, voice_state=voice_state))
                         elif action["action"] == "check_mail":
                             response_text = "Checking your inbox now, sir."
-                            asyncio.create_task(_lookup_and_report("mail", _do_mail_lookup, ws, history=history))
+                            asyncio.create_task(_lookup_and_report("mail", _do_mail_lookup, ws, history=history, voice_state=voice_state))
                         elif action["action"] == "check_dispatch":
                             recent = dispatch_registry.get_most_recent()
                             if not recent:
@@ -2135,7 +2147,7 @@ async def voice_handler(ws: WebSocket):
                                     # Register and dispatch
                                     did = dispatch_registry.register(name, path, target)
                                     asyncio.create_task(
-                                        _execute_prompt_project(name, target, work_session, ws, dispatch_id=did, history=history)
+                                        _execute_prompt_project(name, target, work_session, ws, dispatch_id=did, history=history, voice_state=voice_state)
                                     )
                                 elif embedded_action["action"] == "browse":
                                     asyncio.create_task(_execute_browse(embedded_action["target"]))
@@ -2164,7 +2176,7 @@ async def voice_handler(ws: WebSocket):
                                             history.append({"role": "assistant", "content": f"[Previous dispatch result for {proj_name}]: {recent['summary']}"})
                                         else:
                                             asyncio.create_task(
-                                                _execute_prompt_project(proj_name, prompt, work_session, ws, history=history)
+                                                _execute_prompt_project(proj_name, prompt, work_session, ws, history=history, voice_state=voice_state)
                                             )
                                     else:
                                         log.warning(f"PROMPT_PROJECT missing ||| delimiter: {target}")
@@ -2205,7 +2217,7 @@ async def voice_handler(ws: WebSocket):
                                     else:
                                         asyncio.create_task(create_apple_note("JARVIS Note", target))
                                 elif embedded_action["action"] == "screen":
-                                    asyncio.create_task(_lookup_and_report("screen", _do_screen_lookup, ws, history=history))
+                                    asyncio.create_task(_lookup_and_report("screen", _do_screen_lookup, ws, history=history, voice_state=voice_state))
                                 elif embedded_action["action"] == "read_note":
                                     # Read note in background and report back
                                     async def _read_and_report(search_term, _ws):
