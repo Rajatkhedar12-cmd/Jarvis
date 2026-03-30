@@ -1089,6 +1089,7 @@ async def generate_response(
     projects: list[dict],
     conversation_history: list[dict],
     last_response: str = "",
+    session_summary: str = "",
 ) -> str:
     """Generate a JARVIS response using Anthropic API."""
     now = datetime.now()
@@ -1125,12 +1126,17 @@ async def generate_response(
     if memory_ctx:
         system += f"\n\nJARVIS MEMORY:\n{memory_ctx}"
 
+    # Three-tier memory — inject rolling summary of earlier conversation
+    if session_summary:
+        system += f"\n\nSESSION CONTEXT (earlier in this conversation):\n{session_summary}"
+
     # Self-awareness — remind JARVIS of last response to avoid repetition
     if last_response:
         system += f'\n\nYOUR LAST RESPONSE (do not repeat this):\n"{last_response[:150]}"'
 
-    # Use conversation history — keep the last 40 messages (20 pairs) for context
-    messages = conversation_history[-40:]
+    # Use conversation history — keep the last 20 messages for context
+    # (older conversation is captured in session_summary)
+    messages = conversation_history[-20:]
     # If the last message isn't the current user text, add it
     if not messages or messages[-1].get("content") != text:
         messages = messages + [{"role": "user", "content": text}]
@@ -1821,6 +1827,35 @@ blockquote {{ border-left: 3px solid #0ea5e9; margin-left: 0; padding-left: 16px
         return "Pulled up a search for that, sir."
 
 
+# -- Session Summary (Three-Tier Memory) -----------------------------------
+
+async def _update_session_summary(
+    old_summary: str,
+    rotated_messages: list[dict],
+    client: anthropic.AsyncAnthropic,
+) -> str:
+    """Background Haiku call to update the rolling session summary."""
+    prompt = f"""Update this conversation summary to include the new messages.
+
+Current summary: {old_summary or '(start of conversation)'}
+
+New messages to incorporate:
+{chr(10).join(f'{m["role"]}: {m["content"][:200]}' for m in rotated_messages)}
+
+Write an updated summary in 2-4 sentences capturing the key topics, decisions, and context. Be concise."""
+
+    try:
+        response = await client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        log.warning(f"Summary update failed: {e}")
+        return old_summary  # Keep old summary on failure
+
+
 # -- WebSocket Voice Handler -----------------------------------------------
 
 @app.websocket("/ws/voice")
@@ -1852,6 +1887,12 @@ async def voice_handler(ws: WebSocket):
 
     # Self-awareness — track last spoken response to avoid repetition
     last_jarvis_response = ""
+
+    # Three-tier conversation memory
+    session_buffer: list[dict] = []  # ALL messages, never truncated
+    session_summary: str = ""  # Rolling summary of older conversation
+    summary_update_pending: bool = False
+    messages_since_last_summary: int = 0
 
     log.info("Voice WebSocket connected")
 
@@ -2008,6 +2049,7 @@ async def voice_handler(ws: WebSocket):
                             user_text, anthropic_client, task_manager,
                             cached_projects, history,
                             last_response=last_jarvis_response,
+                            session_summary=session_summary,
                         )
                     else:
                         # Send to claude -p (full power)
@@ -2111,6 +2153,7 @@ async def voice_handler(ws: WebSocket):
                                 user_text, anthropic_client, task_manager,
                                 cached_projects, history,
                                 last_response=last_jarvis_response,
+                                session_summary=session_summary,
                             )
 
                             # Check for action tags embedded in LLM response
@@ -2248,6 +2291,28 @@ async def voice_handler(ws: WebSocket):
                 # Update history
                 history.append({"role": "user", "content": user_text})
                 history.append({"role": "assistant", "content": response_text})
+
+                # Three-tier memory: also track in session buffer
+                session_buffer.append({"role": "user", "content": user_text})
+                session_buffer.append({"role": "assistant", "content": response_text})
+
+                # Check if rolling summary needs updating
+                messages_since_last_summary += 1
+                if messages_since_last_summary >= 5 and len(history) > 20 and not summary_update_pending:
+                    summary_update_pending = True
+                    messages_since_last_summary = 0
+                    # Get messages that are about to be rotated out
+                    rotated = history[:-20] if len(history) > 20 else []
+                    if rotated and anthropic_client:
+                        async def _do_summary():
+                            nonlocal session_summary, summary_update_pending
+                            session_summary = await _update_session_summary(
+                                session_summary, rotated, anthropic_client
+                            )
+                            summary_update_pending = False
+                        asyncio.create_task(_do_summary())
+                    else:
+                        summary_update_pending = False
 
                 # Extract memories in background (doesn't block response)
                 if anthropic_client and len(user_text) > 15:
