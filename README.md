@@ -187,7 +187,7 @@ Free for personal, non-commercial use. Commercial use requires a license — vis
 
 ## Credits
 
-Built by [Ethan](https://ethanplus.ai).
+Built by [Rajat](https://github.com/Rajatkhedar12-cmd)
 
 Powered by [Anthropic Claude](https://anthropic.com) and [Fish Audio](https://fish.audio).
 
