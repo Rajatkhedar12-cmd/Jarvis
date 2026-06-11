@@ -1,53 +1,74 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # JARVIS — Voice AI Assistant
 
-## Overview
-JARVIS (Just A Rather Very Intelligent System) is a voice-first AI assistant for macOS. It runs locally on your machine, connecting to your Apple Calendar, Mail, Notes, and can spawn Claude Code sessions for development tasks.
+JARVIS is a voice-first AI assistant for macOS: a Python/FastAPI backend, a Vite/TypeScript/Three.js frontend, and AppleScript bridges to Apple Calendar, Mail, and Notes. It can also spawn Claude Code subprocesses to perform real development work.
 
-## Quick Start
-When a user clones this repo and starts Claude Code, help them:
-1. Copy .env.example to .env
-2. Get an Anthropic API key from console.anthropic.com
-3. Get a Fish Audio API key from fish.audio
-4. Install Python dependencies: pip install -r requirements.txt
-5. Install frontend dependencies: cd frontend && npm install
-6. Generate SSL certs: openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj '/CN=localhost'
-7. Run the backend: python server.py
-8. Run the frontend: cd frontend && npm run dev
-9. Open Chrome to http://localhost:5173
-10. Click to enable audio, speak to JARVIS
+## First-Run Setup (walk a new user through this)
+The README points new users here; help them through these steps in order:
+1. `cp .env.example .env` — then add keys (see Environment Variables below). Note `.env.example` only lists `ANTHROPIC_API_KEY`; `FISH_API_KEY` is also required.
+2. Get an Anthropic API key from console.anthropic.com and a Fish Audio key from fish.audio.
+3. `pip install -r requirements.txt`
+4. `cd frontend && npm install`
+5. Generate SSL certs (needed for `wss://` + mic access): `openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj '/CN=localhost'`
+6. Install the Claude Code CLI (`claude`) — required for BUILD/RESEARCH/work-mode actions.
+7. Run backend + frontend (see Commands), open Chrome (Web Speech API is Chrome-only), click once to enable audio, then speak.
+
+## Commands
+```bash
+# Backend — defaults to port 8340, auto-enables HTTPS if cert.pem/key.pem exist
+python server.py                    # 0.0.0.0:8340
+python server.py --reload           # auto-reload on changes (dev)
+python server.py --port 8340 --ssl  # force HTTPS
+# Banner prints the actual WebSocket/REST URLs on startup.
+
+# Frontend (separate terminal) — Vite dev server on :5173
+cd frontend && npm run dev
+cd frontend && npm run build        # tsc + vite build
+cd frontend && npm run preview
+
+# Tests — mixed: some are pytest, some are standalone asyncio scripts
+pytest tests/                                   # runs pytest-style tests (needs pytest + pytest-asyncio)
+pytest tests/test_feedback_loop.py              # single file
+pytest tests/test_feedback_loop.py::test_name   # single test
+python tests/test_classifier.py                 # standalone scripts have __main__ / asyncio.run
+```
+Note: `pytest` and `pytest-asyncio` are NOT in `requirements.txt` — install them separately to run the suite. Integration tests (`test_browser_integration`, `test_e2e_pipeline`) hit real services and skip without `ANTHROPIC_API_KEY`.
 
 ## Architecture
-- **Backend**: FastAPI + Python (server.py, ~2300 lines)
-- **Frontend**: Vite + TypeScript + Three.js (audio-reactive orb)
-- **Communication**: WebSocket (JSON messages + binary audio)
-- **AI**: Claude Haiku for fast responses, Claude Opus for research
-- **TTS**: Fish Audio with JARVIS voice model
-- **System**: AppleScript for Calendar, Mail, Notes, Terminal integration
 
-## Key Files
-- `server.py` — Main server, WebSocket handler, LLM integration, action system
-- `frontend/src/orb.ts` — Three.js particle orb visualization
-- `frontend/src/voice.ts` — Web Speech API + audio playback
-- `frontend/src/main.ts` — Frontend state machine
-- `memory.py` — SQLite memory system with FTS5 search
-- `calendar_access.py` — Apple Calendar integration via AppleScript
-- `mail_access.py` — Apple Mail integration (READ-ONLY)
-- `notes_access.py` — Apple Notes integration
-- `actions.py` — System actions (Terminal, Chrome, Claude Code)
-- `browser.py` — Playwright web automation
-- `work_mode.py` — Persistent Claude Code sessions
+**Voice loop:** browser captures speech (Chrome Web Speech API in `frontend/src/voice.ts`) → transcript sent over WebSocket (`/ws/voice`) → `server.py` classifies intent → generates a reply (Claude Haiku) → Fish Audio TTS → audio streamed back as binary frames → `orb.ts` deforms the Three.js particle orb in time with the audio. JSON control messages and binary audio share the same socket.
 
-## Environment Variables
-- `ANTHROPIC_API_KEY` (required) — Claude API access
-- `FISH_API_KEY` (required) — Fish Audio TTS
-- `FISH_VOICE_ID` (optional) — Voice model ID
-- `USER_NAME` (optional) — Your name for JARVIS to use
-- `CALENDAR_ACCOUNTS` (optional) — Comma-separated calendar emails
+**`server.py` (~2700 lines) is the monolith** — WebSocket handler, intent classification, LLM calls, the action system, TTS, and all REST endpoints (`/api/health`, `/api/tasks`, `/api/projects`, `/api/usage`, `/api/settings/*`, `/api/restart`, `/api/fix-self`). Most behavior changes start here. It composes the supporting modules below rather than the other way around.
+
+**Models** (hardcoded in `server.py`): fast path is `claude-haiku-4-5-20251001` (voice replies, classification); deep path is Opus (research). Grep for the literals before changing them.
+
+**Action system** — the LLM emits inline `[ACTION:NAME]` tags that `server.py` parses and dispatches. Tags include `BUILD`, `BROWSE`, `RESEARCH`, `PROMPT_PROJECT`, `ADD_TASK`, `COMPLETE_TASK`, `ADD_NOTE`/`CREATE_NOTE`/`READ_NOTE`, `REMEMBER`, `SCREEN`, `OPEN_TERMINAL`. `BUILD`/`RESEARCH`/`PROMPT_PROJECT` spawn `claude` subprocesses; the rest run AppleScript or local logic.
+
+**macOS integration layer** — all native access is AppleScript (no OAuth): `calendar_access.py`, `mail_access.py` (READ-ONLY by design — do not add write operations), `notes_access.py`, `actions.py` (Terminal/Chrome/Claude Code), `screen.py` (active windows + screenshots). `helpers/` holds a compiled Swift `calendar_helper` binary and alternate calendar fetchers. Any string interpolated into AppleScript must go through `applescript_escape()` (`actions.py`) — there's a dedicated injection test for it.
+
+**Persistence** — single SQLite DB at `data/jarvis.db` (WAL mode), shared by `memory.py` (facts/preferences, FTS5 full-text search), `dispatch_registry.py` (active/recent project builds so JARVIS knows what it's "working on"), and `tracking.py` (success metrics). LLM/cost usage is appended to `data/usage_log.jsonl`. There are no migrations — tables self-create via `CREATE TABLE IF NOT EXISTS` on first use.
+
+**Self-improvement subsystem** — a feedback loop around the Claude Code dispatch path, mostly independent of the voice loop:
+- `planner.py` — conversational planning before spawning a build (asks clarifying questions; `BYPASS_PHRASES` skips planning).
+- `conversation.py` — multi-turn planning sessions, tracks decisions across exchanges.
+- `templates.py` / `ab_testing.py` / `evolution.py` — prompt templates with A/B-tested versions; `evolution.py` analyzes failures and generates improved template versions.
+- `qa.py` — spawns `claude -p` to verify completed task output and auto-retries on failure.
+- `learning.py` / `suggestions.py` — learn request patterns to pre-load context and offer one heuristic follow-up suggestion per completed task.
+- `tracking.py` records the success/failure data the above consume.
+- `work_mode.py` — persistent `claude -p` sessions tied to a project dir (resumes via `--continue`).
+- `monitor.py` — standalone log-watcher that critiques conversation quality; run alongside the server, not imported by it.
+
+**Frontend** (`frontend/src/`) — `main.ts` is the state machine, `voice.ts` does speech-in/audio-out, `orb.ts` the Three.js visualization, `ws.ts` the socket, `settings.ts` the settings UI. Plain Vite + TS, only runtime dep is `three`.
 
 ## Conventions
-- JARVIS personality: British butler, dry wit, economy of language
-- Max 1-2 sentences per voice response
-- Action tags: [ACTION:BUILD], [ACTION:BROWSE], [ACTION:RESEARCH], etc.
-- AppleScript for all macOS integrations (no OAuth needed)
-- Read-only for Mail (safety by design)
-- SQLite for all local data storage
+- **Personality:** British butler — dry wit, economy of language. Voice responses are max 1–2 sentences.
+- **Never modify/delete user data** in Mail, Calendar, or Notes beyond what already exists (Mail is strictly read-only).
+- **No telemetry/analytics**, and no new external services beyond Anthropic and Fish Audio.
+- Avoid adding dependencies unless necessary.
+- `server.py` is a known large monolith; refactoring into modules is welcome but must not break the voice loop.
+
+## Environment Variables
+- `ANTHROPIC_API_KEY` (required), `FISH_API_KEY` (required), `FISH_VOICE_ID` (optional voice model), `USER_NAME` (optional), `CALENDAR_ACCOUNTS` (optional, comma-separated; empty = auto-discover).
